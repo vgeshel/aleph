@@ -112,7 +112,7 @@
 (defn respond [^Channel netty-channel response]
   (let [response (update-in response [:headers]
 		   #(merge
-		      {"server" "aleph (0.1.2)"}
+		      {"server" "aleph (0.1.4)"}
 		      %))
 	body (:body response)]
     (cond
