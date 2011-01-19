@@ -1,4 +1,4 @@
-(defproject aleph "0.1.4"
+(defproject aleph "0.1.4.1"
   :description "a framework for asynchronous communication"
   :repositories {"jboss" "http://repository.jboss.org/nexus/content/groups/public/"}
   :license {:name "Eclipse Public License - v 1.0"
