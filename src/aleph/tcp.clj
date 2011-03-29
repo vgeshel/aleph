@@ -12,6 +12,8 @@
     [aleph netty formats]
     [lamina.core]
     [gloss core io])
+  (:require
+    [clojure.contrib.logging :as log])
   (:import
     [org.jboss.netty.channel
      Channel
@@ -78,6 +80,11 @@
 				      (siphon-result result returned-result)
 				      result))
 				  nil))
+			      :error-handler (fn [ex]
+					       (log/error
+						 "Error in handler, closing connection."
+						 ex)
+					       (close write-queue))
 			      (fn [_]
 				(close write-queue)))))))
       :channel-close (upstream-stage
