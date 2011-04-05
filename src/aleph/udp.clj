@@ -15,6 +15,7 @@
   (:require
     [clojure.contrib.logging :as log])
   (:import
+    [org.jboss.netty.buffer ChannelBuffer]
     [org.jboss.netty.bootstrap ConnectionlessBootstrap]
     [org.jboss.netty.channel.socket.nio NioDatagramChannelFactory]
     [org.jboss.netty.handler.codec.serialization ObjectEncoder ObjectDecoder]
@@ -42,10 +43,20 @@
       (apply create-netty-pipeline
 	(concat
 	  intermediate-stages
-	  [:receive (udp-message-stage
+	  [:upstream-error (upstream-stage error-stage-handler)
+	   :receive (udp-message-stage
 		      (fn [msg addr]
-			(let [msg (if frame (decode frame (channel-buffer->byte-buffers msg)) msg)]
-			  (enqueue ch (assoc addr :message msg)))))])))))
+			(let [msg (cond
+				    frame
+				    (decode frame (channel-buffer->byte-buffers msg))
+
+				    (instance? ChannelBuffer msg)
+				    (channel-buffer->byte-buffers msg)
+
+				    :else
+				    msg)]
+			  (enqueue ch (assoc addr :message msg)))))
+	   :downstream-error (downstream-stage error-stage-handler)])))))
 
 (defn udp-socket
   "Returns a result-channel that emits a channel if it successfully opens
