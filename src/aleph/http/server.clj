@@ -12,7 +12,7 @@
   (:use
     [aleph netty formats]
     [aleph.http utils core websocket]
-    [lamina core]
+    [lamina core executors]
     [lamina.core.pipeline :only (success-result)]
     [clojure.pprint])
   (:require
@@ -59,22 +59,20 @@
 
 (defn- respond-with-string
   ([^Channel netty-channel options response]
-     (respond-with-string netty-channel options response "utf-8"))
-  ([^Channel netty-channel options response charset]
-     (let [body (-> response :body (string->byte-buffer charset) byte-buffer->channel-buffer)
+     (let [response (update-in response [:character-encoding] #(or % "utf-8"))	   
+	   body (-> response
+		  :body
+		  (string->byte-buffer (:character-encoding response))
+		  byte-buffer->channel-buffer)
 	   response (transform-aleph-response
-		      (-> response
-			(update-in [:headers] assoc "Charset" charset)
-			(assoc :body body))
+		      (assoc response :body body)
 		      options)]
        (write-to-channel netty-channel response false))))
 
 (defn- respond-with-sequence
   ([netty-channel options response]
-     (respond-with-sequence netty-channel options response "UTF-8"))
-  ([netty-channel options response charset]
      (respond-with-string netty-channel options
-       (update-in response [:body] #(apply str %)) charset)))
+       (update-in response [:body] #(apply str %)))))
 
 (defn- respond-with-stream
   [^Channel netty-channel options response]
@@ -94,7 +92,7 @@
 		       "application/octet-stream")
 	fc (.getChannel (RandomAccessFile. file "r"))
 	response (-> response
-		   (update-in [:headers "Content-Type"] #(or % content-type))
+		   (update-in [:content-type] #(or % content-type))
 		   (assoc :body fc))]
     (write-to-channel netty-channel
       (transform-aleph-response response options)
@@ -103,11 +101,9 @@
 
 (defn- respond-with-channel
   [netty-channel options returned-result response]
-  (let [charset (get-in response [:headers "Charset"] "utf-8")
-	response (assoc-in response [:headers "Charset"] charset)
+  (let [response (update-in response [:character-encoding] #(or % "utf-8"))
 	initial-response ^HttpResponse (transform-aleph-response response options)
 	ch (:body response)
-	headers (:headers response)
 	write-to-channel (fn [& args]
 			   (let [result (apply write-to-channel args)]
 			     (enqueue returned-result result)
@@ -120,9 +116,9 @@
 	      (let [msg (to-channel-buffer
 			  (:body
 			    (encode-aleph-msg
-			      {:headers headers :body msg}
+			      (assoc response :body msg)
 			      options))
-			  charset)
+			  (:character-encoding response))
 		    chunk (DefaultHttpChunk. msg)]
 		(write-to-channel netty-channel chunk false)
 		nil)))))
@@ -131,17 +127,14 @@
 
 (defn respond-with-channel-buffer
   [netty-channel options response]
-  (let [response (update-in response [:headers "Content-Type"]
-		   #(or % "application/octet-stream"))]
+  (let [response (update-in response [:content-type] #(or % "application/octet-stream"))]
     (write-to-channel netty-channel
       (transform-aleph-response response options)
       false)))
 
 (defn respond [^Channel netty-channel options returned-result response]
-  (let [response (update-in response [:headers]
-		   #(merge
-		      {"Server" "aleph (0.1.5)"}
-		      %))
+  (let [response (update-in response [:headers] (partial merge {"Server" "aleph (0.1.5)"}))
+	response (merge (content-info (:headers response)) response)
 	body (:body response)]
     (cond
       (nil? body) (respond-with-string netty-channel options (assoc response :body ""))
@@ -151,7 +144,8 @@
       (instance? File body) (respond-with-file netty-channel options response)
       :else (let [response (encode-aleph-msg response options)
 		  original-body body
-		  body (:body response)]
+		  body (:body response)
+		  options (assoc options :auto-transform false)]
 	      (cond
 		(sequential? body)
 		(respond-with-sequence netty-channel options response)
@@ -175,17 +169,17 @@
     ch))
 
 (defn siphon-result* [src dst]
-  (when (result-channel? dst)
+  (when (and (result-channel? src) (result-channel? dst))
     (siphon-result src dst)))
 
 (defn read-streaming-request
   "Read in all the chunks for a streamed request."
-  [headers options in out]
+  [request options in out]
   (run-pipeline in
     read-channel
-    (fn [^HttpChunk request]
-      (let [last? (.isLast request)
-	    body (:body (decode-aleph-msg {:headers headers :body (.getContent request)} options))]
+    (fn [^HttpChunk chunk]
+      (let [last? (.isLast chunk)
+	    body (:body (decode-aleph-msg (assoc request :body (.getContent chunk)) options))]
 	(if last?
 	  (close out)
 	  (enqueue out body))
@@ -198,28 +192,32 @@
   (let [chunked? (.isChunked netty-request)
 	request (assoc (transform-netty-request netty-request options)
 		  :scheme :http
-		  :remote-addr (channel-origin netty-channel))]
-    (if-not chunked?
-      (do
-	(handler out request)
-	nil)
-      (let [headers (:headers request)
-	    stream (channel)]
-	(handler out (assoc request :body stream))
-	(read-streaming-request headers options in stream)))))
+		  :remote-addr (channel-origin netty-channel))
+	stream (when chunked? (channel))]
+    (run-pipeline nil
+      :error-handler (fn [ex]
+		       (log/error "Error in HTTP handler, closing." ex)
+		       (close-channel netty-channel))
+      (fn [_]
+	(with-thread-pool (:thread-pool options)
+	  {:timeout (:handler-timeout options)}
+	  (if chunked?
+	    (handler out (assoc request :body stream))
+	    (handler out request)))))
+    (when chunked?
+      (read-streaming-request request options in stream))))
 
 (defn non-pipelined-loop
   "Wait for the response for each request before processing the next one."
   [^Channel netty-channel options in handler]
   (run-pipeline in
     :error-handler (fn [ex]
-		     (log/error "Error in handler, closing connection." ex)
-		     (.close netty-channel))
+		     (log/error "Error in keep-alive HTTP connection, closing." ex)
+		     (close-channel netty-channel))
     read-channel
     (fn [^HttpRequest request]
       (let [out (wrap-response-channel (constant-channel))]
-	(run-pipeline
-	  (handle-request netty-channel options request handler in out)
+	(run-pipeline (handle-request netty-channel options request handler in out)
 	  (fn [_] (read-channel out))
 	  (fn [[returned-result response]]
 	    (siphon-result*
@@ -303,9 +301,21 @@
    request is a WebSocket handshake, the channel represents a full duplex socket, which
    communicates via complete (i.e. non-streaming) strings."
   [handler options]
-  (start-server
-    #(create-pipeline handler options)
-    options))
+  (let [options (merge
+		  {:handler-timeout -1}
+		  options
+		  {:thread-pool (thread-pool
+				  (merge
+				    {:name (str "HTTP server on port " (:port options))
+				     :stat-period (* 30 1000)}
+				    (:thread-pool options)))})
+	stop-fn (start-server
+		  #(create-pipeline handler options)
+		  options)]
+    (fn []
+      (run-pipeline (stop-fn)
+	(fn [_] (.shutdown (:thread-pool options)))))))
+
 
 
 

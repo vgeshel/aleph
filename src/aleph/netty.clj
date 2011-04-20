@@ -43,7 +43,8 @@
      ServerBootstrap
      ClientBootstrap]
     [java.util.concurrent
-     Executors]
+     Executors
+     Executor]
     [java.net
      URI
      InetSocketAddress
@@ -52,6 +53,19 @@
      InputStream]
     [java.nio
      ByteBuffer]))
+
+;;;
+
+(def netty-thread-pool (Executors/newCachedThreadPool))
+
+(defn enqueue-task [f]
+  (let [result (result-channel)]
+    (.submit ^Executor netty-thread-pool
+      #(siphon-result
+	 (run-pipeline nil
+	   (fn [_] (f)))
+	 result))
+    result))
 
 ;;;
 
@@ -204,22 +218,21 @@
 (defn write-to-channel
   [^Channel netty-channel msg close?
    & {close-callback :on-close write-callback :on-write host :host port :port}]
-  (when (.isOpen netty-channel)
-    (if msg
-      (run-pipeline
-	(io!
-	  (if (and host port)
-	    (.write netty-channel msg (InetSocketAddress. host port))
-	    (.write netty-channel msg)))
-	wrap-netty-channel-future
-	(fn [_]
-	  (when write-callback
-	    (write-callback))
-	  (if close?
-	    (close-channel netty-channel close-callback)
-	    true)))
-      (when close?
-        (close-channel netty-channel close-callback)))))
+  (if msg
+    (run-pipeline
+      (io!
+	(if (and host port)
+	  (.write netty-channel msg (InetSocketAddress. host port))
+	  (.write netty-channel msg)))
+      wrap-netty-channel-future
+      (fn [_]
+	(when write-callback
+	  (write-callback))
+	(if close?
+	  (close-channel netty-channel close-callback)
+	  true)))
+    (when close?
+      (close-channel netty-channel close-callback))))
 
 ;;;
 
@@ -280,8 +293,6 @@
     ((client/wrap-url identity) options)
     options))
 
-(def client-thread-pool (Executors/newCachedThreadPool))
-
 (defn create-client
   [pipeline-fn send-encoder options]
   (let [options (split-url options)
@@ -292,8 +303,8 @@
 	channel-group (DefaultChannelGroup.)
 	client (ClientBootstrap.
 		 (NioClientSocketChannelFactory.
-		   client-thread-pool
-		   client-thread-pool))]
+		   netty-thread-pool
+		   netty-thread-pool))]
     (doseq [[k v] (merge default-client-options (:netty options))]
       (.setOption client k v))
     (.setPipelineFactory client
