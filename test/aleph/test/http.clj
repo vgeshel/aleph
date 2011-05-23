@@ -7,14 +7,16 @@
 ;;   You must not remove this notice, or any other, from this software.
 
 (ns aleph.test.http
-  (:use [aleph http])
   (:use
+    [aleph http]
+    [aleph.http.client :only (http-connection)]
     [lamina core connections]
     [clojure.test]
     [clojure.contrib.duck-streams :only [pwd]]
     [clojure.contrib.seq :only [indexed]])
   (:require
-    [clojure.string :as str])
+    [clojure.string :as str]
+    [clojure.contrib.logging :as log])
   (:import
     [java.io
      File
@@ -49,6 +51,7 @@
    :body (ByteArrayInputStream. (.getBytes stream-response))})
 
 (def latch (promise))
+(def browser-server (atom nil))
 
 (def route-map
   {"/stream" stream-handler
@@ -58,14 +61,17 @@
    "/stop" (fn [_]
 	     (try
 	       (deliver latch true) ;;this can be triggered more than once, sometimes
-	       (@server)
+	       (@browser-server)
 	       (catch Exception e
 		 )))})
 
+(defn print-vals [& args]
+  (apply prn args)
+  (last args))
+
 (defn basic-handler [ch request]
   (when-let [handler (route-map (:uri request))]
-    (enqueue-and-close ch
-      (handler request))))
+    (enqueue ch (handler request))))
 
 (def expected-results
   (->>
@@ -101,67 +107,101 @@
 
 (defn wait-for-request [client path]
   (-> (client {:method :get, :url (str "http://localhost:8080/" path), :auto-transform true})
-    (wait-for-result 1000)
+    (wait-for-result 500)
     :body))
 
-(defmacro with-server [handler & body]
-  `(do
-     (let [kill-fn# (start-http-server ~handler {:port 8080, :auto-transform true})]
-      (try
-	~@body
-	(finally
-	  (kill-fn#))))))
+(defmacro with-server [server & body]
+  `(let [kill-fn# ~server]
+     (try
+       ~@body
+       (finally
+	 (kill-fn#)))))
 
-'(deftest browser-http-response
-   (println "waiting for browser test")
-   (start-http-server basic-handler {:port 8080})
-   (is @latch))
+(defmacro with-handler [handler & body]
+  `(with-server (start-http-server ~handler {:port 8080, :auto-transform true})
+     ~@body))
 
-(deftest single-requests
-  (with-server basic-handler
+(defn is-closed? [handler & requests]
+  (with-handler handler
+    (let [connection @(http-connection {:url "http://localhost:8080"})]
+      (apply enqueue connection requests)
+      (doall (lazy-channel-seq connection 500))
+      (is (closed? connection)))))
+
+;;;
+
+#_(deftest test-browser-http-response
+    (println "waiting for browser test")
+    (reset! browser-server (start-http-server basic-handler {:port 8080}))
+    (is @latch))
+
+(deftest test-single-requests
+  (with-handler basic-handler
     (doseq [[index [path result]] (indexed expected-results)]
       (let [client (http-client {:url "http://localhost:8080", :auto-transform true})]
 	(is (= result (wait-for-request client path)))
 	(close-connection client)))))
 
-(deftest multiple-requests
-  (with-server basic-handler
+(deftest test-multiple-requests
+  (with-handler basic-handler
     (let [client (http-client {:url "http://localhost:8080", :auto-transform true})]
       (doseq [[index [path result]] (indexed expected-results)]
 	(is (= result (wait-for-request client path))))
       (close-connection client))))
 
-(deftest streaming-response
-  (with-server streaming-response-handler
-    (let [result (sync-http-request {:url "http://localhost:8080", :method :get, :auto-transform true} 1000)]
+(deftest test-streaming-response
+  (with-handler streaming-response-handler
+    (let [result (sync-http-request
+		   {:url "http://localhost:8080"
+		    :method :get
+		    :auto-transform true}
+		   1000)]
       (is
 	(= (map str "abcdefghi")
 	   (channel-seq (:body result) 1000))))))
 
-(deftest streaming-request
+(deftest test-streaming-request
   (let [s (map (fn [n] {:tag :value, :attrs nil, :content [(str n)]}) (range 10))]
     (doseq [content-type ["application/json" "application/xml"]]
-      (with-server streaming-request-handler
+      (with-handler streaming-request-handler
 	(let [ch (apply closed-channel s)]
 	  (let [result (sync-http-request
 			 {:url "http://localhost:8080"
 			  :method :post
 			  :headers {"content-type" content-type}
-			  :body ch,
+			  :body ch
 			  :auto-transform true}
 			 1000)]
 	    (let [transform-results (fn [x] (map #(-> % :content first str/trim) x))]
 	      (is (= (transform-results s) (transform-results (channel-seq (:body result) 1000)))))))))))
 
-(deftest auto-transform-test
-  (with-server json-response-handler
+(deftest test-auto-transform
+  (with-handler json-response-handler
     (let [result (sync-http-request {:url "http://localhost:8080", :method :get, :auto-transform true} 1000)]
       (is (= {:foo 1, :bar 2} (:body result))))))
 
-(deftest websocket-server
-  (with-server (start-http-server (fn [ch _] (siphon ch ch)) {:port 8081, :websocket true})
-    (let [result (run-pipeline (websocket-client {:url "http://localhost:8081"})
+(deftest test-websockets
+  (with-server (start-http-server (fn [ch _] (siphon ch ch)) {:port 8080, :websocket true})
+    (let [result (run-pipeline (websocket-client {:url "http://localhost:8080"})
 		   (fn [ch]
-		     (enqueue ch "abc")
-		     (read-channel ch 1000)))]
-      (is (= "abc" (wait-for-result result 1000))))))
+		     (enqueue ch "a" "b" "c")
+		     ch))]
+      (is (= ["a" "b" "c"] (channel-seq @result 1000)))
+      (close @result))))
+
+(deftest test-single-response-close
+  (is-closed? basic-handler
+    {:method :get, :url "http://localhost:8080/string", :keep-alive? false}))
+
+(deftest test-streaming-request-close
+  (is-closed? streaming-request-handler
+    {:method :post
+     :url "http://localhost:8080/"
+     :content-encoding "text/plain"
+     :body (closed-channel "a" "b" "c")
+     :keep-alive? false}))
+
+(deftest test-multiple-response-close
+  (is-closed? basic-handler
+    {:method :get, :url "http://localhost:8080/string", :keep-alive? true}
+    {:method :get, :url "http://localhost:8080/string", :keep-alive? false}))

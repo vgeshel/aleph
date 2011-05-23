@@ -31,6 +31,8 @@
      ChannelPipeline
      ChannelFuture
      ChannelFutureListener]
+    [org.jboss.netty.buffer
+     ChannelBuffer]
     [org.jboss.netty.channel.group
      ChannelGroup
      DefaultChannelGroup
@@ -53,19 +55,6 @@
      InputStream]
     [java.nio
      ByteBuffer]))
-
-;;;
-
-(def netty-thread-pool (Executors/newCachedThreadPool))
-
-(defn enqueue-task [f]
-  (let [result (result-channel)]
-    (.submit ^Executor netty-thread-pool
-      #(siphon-result
-	 (run-pipeline nil
-	   (fn [_] (f)))
-	 result))
-    result))
 
 ;;;
 
@@ -245,10 +234,33 @@
    "readWriteFair" true,
    "child.tcpNoDelay" true})
 
-(defn create-pipeline-factory [^ChannelGroup channel-group pipeline-fn & args]
+(defn create-pipeline-factory [^ChannelGroup channel-group options pipeline-fn & args]
   (reify ChannelPipelineFactory
     (getPipeline [_]
       (let [pipeline ^ChannelPipeline (apply pipeline-fn args)]
+	(when-let [traffic-hook (-> options :hooks :traffic)]
+	  (.addFirst pipeline
+	    "incoming-traffic-listener"
+	    (upstream-stage
+	      (fn [event]
+		(when-let [msg ^ChannelBuffer (message-event event)]
+		  (enqueue traffic-hook
+		    {:received-messages 1
+		     :sent-messages 0
+		     :received-bytes (.readableBytes msg)
+		     :sent-bytes 0}))
+		nil)))
+	  (.addFirst pipeline
+	    "outgoing-traffic-listener"
+	    (downstream-stage
+	      (fn [event]
+		(when-let [msg ^ChannelBuffer (message-event event)]
+		  (enqueue traffic-hook
+		    {:received-messages 0
+		     :sent-messages 1
+		     :received-bytes 0
+		     :sent-bytes (.readableBytes msg)}))
+		nil))))
 	(.addFirst pipeline
 	  "channel-listener"
 	  (upstream-stage
@@ -264,21 +276,22 @@
   "Starts a server.  Returns a function that stops the server."
   [pipeline-fn options]
   (let [port (:port options)
-	server (ServerBootstrap.
-		 (NioServerSocketChannelFactory.
-		   (Executors/newCachedThreadPool)
-		   (Executors/newCachedThreadPool)))
+	channel-factory (NioServerSocketChannelFactory.
+			  (Executors/newCachedThreadPool)
+			  (Executors/newCachedThreadPool))
+	server (ServerBootstrap. channel-factory)
 	channel-group (DefaultChannelGroup.)]
     (doseq [[k v] (merge default-server-options (:netty options))]
       (.setOption server k v))
     (.setPipelineFactory server
-      (create-pipeline-factory channel-group pipeline-fn))
+      (create-pipeline-factory channel-group options pipeline-fn))
     (.add channel-group (.bind server (InetSocketAddress. port)))
     (fn []
       (run-pipeline
 	(.close channel-group)
 	wrap-netty-channel-group-future
-	(fn [_] (.releaseExternalResources server))))))
+	(fn [_]
+	  (.releaseExternalResources server))))))
 
 ;;;
 
@@ -303,12 +316,13 @@
 	channel-group (DefaultChannelGroup.)
 	client (ClientBootstrap.
 		 (NioClientSocketChannelFactory.
-		   netty-thread-pool
-		   netty-thread-pool))]
+		   (Executors/newCachedThreadPool)
+		   (Executors/newCachedThreadPool)
+		   (.availableProcessors (Runtime/getRuntime))))]
     (doseq [[k v] (merge default-client-options (:netty options))]
       (.setOption client k v))
     (.setPipelineFactory client
-      (create-pipeline-factory channel-group pipeline-fn outer))
+      (create-pipeline-factory channel-group options pipeline-fn outer))
     (run-pipeline (.connect client (InetSocketAddress. ^String host (int port)))
       wrap-netty-channel-future
       (fn [^Channel netty-channel]
@@ -319,7 +333,11 @@
 	    wrap-netty-channel-future
 	    (fn [_]
 	      (close inner)
-	      (close outer)))
+	      (close outer)
+	      (run-pipeline
+		(.close channel-group)
+		wrap-netty-channel-group-future
+		(fn [_] (.releaseExternalResources client)))))
 	  (.add channel-group netty-channel)
 	  (run-pipeline
 	    (receive-in-order outer
