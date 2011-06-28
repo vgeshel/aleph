@@ -10,7 +10,7 @@
   aleph.tcp
   (:use
     [aleph netty formats]
-    [lamina.core]
+    [lamina core trace]
     [gloss core io])
   (:require
     [clojure.contrib.logging :as log])
@@ -63,8 +63,7 @@
 		(if-not decoder
 		  inner
 		  (splice (decode-channel inner decoder) inner)))]
-    (create-netty-pipeline
-      :upstream-error (upstream-stage error-stage-handler)
+    (create-netty-pipeline (:name options)
       :channel-open (upstream-stage
 		      (channel-open-stage
 			(fn [^Channel netty-channel]
@@ -72,19 +71,18 @@
 					      netty-channel
 					      #(write-to-channel netty-channel nil true))]
 			    (handler inner {:remote-addr (.getRemoteAddress netty-channel)})
-			    (run-pipeline
-			      (receive-in-order outer
-				(fn [[returned-result msg]]
-				  (enqueue write-queue
-				    (let [result (write-to-channel netty-channel (send-encoder msg) false)]
-				      (siphon-result result returned-result)
-				      result))
-				  nil))
+			    (run-pipeline nil
 			      :error-handler (fn [ex]
-					       (log/error
-						 "Error in handler, closing connection."
-						 ex)
-					       (close write-queue))
+					       (trace [(:name options) :errors]
+						 {:exception ex, :channel inner}))
+			      (fn [_]
+				(receive-in-order outer
+				  (fn [[returned-result msg]]
+				    (enqueue write-queue
+				      (let [result (write-to-channel netty-channel (send-encoder msg) false)]
+					(siphon-result result returned-result)
+					result))
+				    nil)))
 			      (fn [_]
 				(close write-queue)))))))
       :channel-close (upstream-stage
@@ -95,8 +93,7 @@
       :receive (message-stage
 		 (fn [netty-channel msg]
 		   (enqueue outer (receive-encoder msg))
-		   nil))
-      :downstream-handler (downstream-stage error-stage-handler))))
+		   nil)))))
 
 (defn basic-client-pipeline
   [ch receive-encoder options]
@@ -114,13 +111,11 @@
 		     (enqueue ch msg))))
 	       src)
 	     ch)]
-    (create-netty-pipeline
-      :upstream-error (upstream-stage error-stage-handler)
+    (create-netty-pipeline (:name options)
       :receive (message-stage
 		 (fn [netty-channel msg]
 		   (enqueue ch (receive-encoder msg))
-		   nil))
-      :downstream-error (downstream-stage error-stage-handler))))
+		   nil)))))
 
 (defn start-tcp-server
   "Starts a TCP server. The handler must be a function that takes two parameters,
@@ -145,14 +140,17 @@
    If a frame is specified, only data structured per the frame will be accepted (i.e. raw
    bytes are no longer an acceptable input)."
   [handler options]
-  (start-server
-    (fn []
-      (basic-server-pipeline
-	handler
-	#(ChannelBuffers/wrappedBuffer (into-array ByteBuffer (to-buf-seq %)))
-	#(seq (.toByteBuffers ^ChannelBuffer %))
-	options))
-    options))
+  (let [options (merge
+		  {:name (str "tcp-server." (:port options))}
+		  options)]
+    (start-server
+      (fn []
+	(basic-server-pipeline
+	  handler
+	  #(ChannelBuffers/wrappedBuffer (into-array ByteBuffer (to-buf-seq %)))
+	  #(seq (.toByteBuffers ^ChannelBuffer %))
+	  options))
+      options)))
 
 (defn tcp-client
   "Creates a TCP connection to a server.  Returns a result-channel that will emit a channel
@@ -163,7 +161,7 @@
    start-tcp-server."
   [options]
   (let [options (merge
-		  {:name (str "tcp-server." (:port options))}
+		  {:name (str "tcp-client." (:host options) ":" (:port options) ".")}
 		  options)
 	encoder (create-frame
 		  (or (:encoder options) (:frame options))

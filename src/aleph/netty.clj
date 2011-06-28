@@ -10,9 +10,8 @@
   aleph.netty
   (:use
     [clojure.contrib.def :only (defvar- defmacro-)]
-    [lamina.core]
-    [lamina.core.pipeline :only (success! error!)]
-    [aleph formats])
+    [lamina core trace api]
+    [aleph formats core])
   (:require
     [clj-http.client :as client]
     [clojure.contrib.logging :as log])
@@ -59,9 +58,9 @@
 ;;;
 
 (defn channel-origin [netty-channel]
-  (let [socket-address (.getRemoteAddress ^Channel netty-channel)
-	inet-address (.getAddress ^InetSocketAddress socket-address)]
-    (.getHostAddress ^InetAddress inet-address)))
+  (when-let [socket-address (.getRemoteAddress ^Channel netty-channel)]
+    (when-let [inet-address (.getAddress ^InetSocketAddress socket-address)]
+      (.getHostAddress ^InetAddress inet-address))))
 
 (defn message-event
   "Returns contents of message event, or nil if it's a different type of message."
@@ -78,6 +77,12 @@
   [evt]
   (when (instance? MessageEvent evt)
     (.getRemoteAddress ^MessageEvent evt)))
+
+(defn exception-event
+  "Returns origin of message event, or nil if it's a different type of message."
+  [evt]
+  (when (instance? ExceptionEvent evt)
+    (.getCause ^ExceptionEvent evt)))
 
 (defmacro do-once [& body]
   `(let [latch# (atom false)]
@@ -145,10 +150,12 @@
 	  (f ch)))
       nil)))
 
-(defn error-stage-handler [evt]
-  (when (instance? ExceptionEvent evt)
-    (log/warn "aleph.netty" (.getCause ^ExceptionEvent evt)))
-  evt)
+(defn refuse-connection-stage []
+  (reify ChannelUpstreamHandler
+    (handleUpstream [_ ctx evt]
+      (if-let [ch ^Channel (channel-event evt)]
+	(.close ch)
+	(.sendUpstream ctx evt)))))
 
 (defn create-netty-pipeline
   "Creates a pipeline.  Each stage must have a name.
@@ -157,10 +164,35 @@
    (create-netty-pipeline
      :stage-a a
      :stage-b b)"
-  [& stages]
-  (let [netty-pipeline (Channels/pipeline)]
+  [pipeline-name & stages]
+  (let [netty-pipeline (Channels/pipeline)
+	error-probe (canonical-probe [pipeline-name :errors])
+	_ (register-probe error-probe)
+	error-handler (fn [evt]
+			(when-let [ex (exception-event evt)]
+			  (when-not (trace* error-probe ex)
+			    (.printStackTrace ex)
+			    (log/error ex))
+			  nil))
+	traffic-handler (fn [probe-suffix]
+			  (let [canonical (canonical-probe [pipeline-name :traffic probe-suffix])]
+			    (register-probe canonical)
+			    (fn [evt]
+			      (when-let [msg (message-event evt)]
+				(trace* canonical
+				  {:address (-> evt channel-event channel-origin)
+				   :bytes (.readableBytes ^ChannelBuffer msg)}))
+			      nil)))]
     (doseq [[id stage] (partition 2 stages)]
       (.addLast netty-pipeline (name id) stage))
+    (.addFirst netty-pipeline "incoming-traffic"
+      (upstream-stage (traffic-handler :in)))
+    (.addFirst netty-pipeline "outgoing-traffic"
+      (downstream-stage (traffic-handler :out)))
+    (.addLast netty-pipeline "outgoing-error"
+      (downstream-stage error-handler))
+    (.addFirst netty-pipeline "incoming-error"
+      (upstream-stage error-handler))
     netty-pipeline))
 
 ;;;
@@ -234,41 +266,117 @@
    "readWriteFair" true,
    "child.tcpNoDelay" true})
 
-(defn create-pipeline-factory [^ChannelGroup channel-group options pipeline-fn & args]
-  (reify ChannelPipelineFactory
-    (getPipeline [_]
-      (let [pipeline ^ChannelPipeline (apply pipeline-fn args)]
-	(.addFirst pipeline
-	  "channel-listener"
-	  (upstream-stage
-	    (fn [evt]
-	      (when-let [ch ^Channel (channel-event evt)]
-		(if (.isOpen ch)
-		  (.add channel-group ch)
-		  (.remove channel-group ch)))
-	      nil)))
-	pipeline))))
+(defn create-pipeline-factory
+  [^ChannelGroup channel-group options
+   canonical-connections-probe refuse-connections?
+   pipeline-fn & args]
+  (when canonical-connections-probe
+    (register-probe canonical-connections-probe))
+  (let [connection-count (atom 0)]
+    (reify ChannelPipelineFactory
+      (getPipeline [_]
+	(let [pipeline ^ChannelPipeline (apply pipeline-fn args)]
+	  (.addFirst pipeline
+	    "channel-listener"
+	    (if (and refuse-connections? @refuse-connections?)
+	      (refuse-connection-stage)
+	      (upstream-stage
+		(fn [evt]
+		  (when-let [ch ^Channel (channel-event evt)]
+		    (if (.isOpen ch)
+		      (when (.add channel-group ch)
+			(let [origin (channel-origin ch)
+			      connections (swap! connection-count inc)]
+			  (trace* canonical-connections-probe
+			    {:event :opened
+			     :connections connections
+			     :address origin})
+			  (run-pipeline (.getCloseFuture ch)
+			    wrap-netty-channel-future
+			    (fn [_]
+			      (let [connections (swap! connection-count dec)]
+				(trace* canonical-connections-probe
+				  {:event :closed
+				   :connections connections
+				   :address origin}))))))))
+		  nil))))
+	  pipeline)))))
+
+(defn graceful-shutdown [server timeout]
+  (let [connections (server-probe server :connections)
+	num-connections #(dec (count (netty-channels server)))]
+    (let [ready-to-close (if (zero? (num-connections))
+			   (run-pipeline true)
+			   (run-pipeline connections
+			     read-channel
+			     (fn [_]
+			       (let [connections (num-connections)]
+				 (trace [(name server) :shutdown :pending]
+				   {:name (name server)
+				    :connections connections})
+				 (when (pos? connections)
+				   (restart))))))]
+      (run-pipeline (-> ready-to-close (poll-result timeout) read-channel)
+	(fn [result]
+	  (stop-server-immediately server))))))
 
 (defn start-server
   "Starts a server.  Returns a function that stops the server."
   [pipeline-fn options]
-  (let [port (:port options)
+  (let [options (merge
+		  {:name (gensym "server.")}
+		  options)
+	refuse-connections? (atom false)
+	port (:port options)
 	channel-factory (NioServerSocketChannelFactory.
 			  (Executors/newCachedThreadPool)
 			  (Executors/newCachedThreadPool))
 	server (ServerBootstrap. channel-factory)
 	channel-group (DefaultChannelGroup.)]
+    ;; connect server probes
+    (siphon-probes (:name options) (:probes options))
+
+    ;; set netty flags
     (doseq [[k v] (merge default-server-options (:netty options))]
       (.setOption server k v))
+
+    ;; set pipeline factory
     (.setPipelineFactory server
-      (create-pipeline-factory channel-group options pipeline-fn))
+      (create-pipeline-factory
+	channel-group
+	options
+	(canonical-probe [(:name options) :connections])
+	refuse-connections?
+	pipeline-fn))
+
+    ;; add parent channel to channel-group
     (.add channel-group (.bind server (InetSocketAddress. port)))
-    (fn []
-      (run-pipeline
-	(.close channel-group)
-	wrap-netty-channel-group-future
-	(fn [_]
-	  (.releaseExternalResources server))))))
+
+    ;; create server instance
+    (reify AlephServer
+      (stop-server-immediately [_]
+	(trace [(:name options) :shutdown]
+	  {:name options})
+	(run-pipeline
+	  (.close channel-group)
+	  wrap-netty-channel-group-future
+	  (fn [_]
+	    (task (.releaseExternalResources server)))))
+      (stop-server [this timeout]
+	(reset! refuse-connections? true)
+	(graceful-shutdown this timeout))
+      (server-probe [_ probe-name]
+	(probe-channel [(:name options) probe-name]))
+      (netty-channels [_]
+	(set channel-group))
+      clojure.lang.IFn
+      (invoke [this]
+	(stop-server-immediately this))
+      clojure.lang.Named
+      (getName [_]
+	(:name options))
+      (getNamespace [_]
+	nil))))
 
 ;;;
 
@@ -296,13 +404,30 @@
 		   (Executors/newCachedThreadPool)
 		   (Executors/newCachedThreadPool)
 		   (.availableProcessors (Runtime/getRuntime))))]
+
+    ;; setup client probes
+    (siphon-probes (:name options) (:probes options))
+
+    ;; set netty flags
     (doseq [[k v] (merge default-client-options (:netty options))]
       (.setOption client k v))
+
+    ;; set pipeline factory
     (.setPipelineFactory client
-      (create-pipeline-factory channel-group options pipeline-fn outer))
+      (create-pipeline-factory
+	channel-group
+	options
+	(canonical-probe [(:name options) :connections])
+	nil
+	pipeline-fn
+	outer))
+
+    ;; intialize client
     (run-pipeline (.connect client (InetSocketAddress. ^String host (int port)))
       wrap-netty-channel-future
       (fn [^Channel netty-channel]
+
+	;; write queue 
 	(let [write-queue (create-write-queue
 			    netty-channel
 			    #(write-to-channel netty-channel nil true))]
@@ -314,7 +439,7 @@
 	      (run-pipeline
 		(.close channel-group)
 		wrap-netty-channel-group-future
-		(fn [_] (.releaseExternalResources client)))))
+		(fn [_] (task (.releaseExternalResources client))))))
 	  (.add channel-group netty-channel)
 	  (run-pipeline
 	    (receive-in-order outer

@@ -45,19 +45,16 @@
 		  :query-string uri
 		  :server-port destination
 		  :content-type content-info
-		  :content-encoding content-info
+		  :character-encoding content-info
+		  :content-length content-length
 		  :request-method request-method)]
     (assoc request
-      :body (let [body (-> request
-			 (assoc :body (.getContent req))
- 			 (decode-aleph-message options)
- 			 :body)]
-	      (if (final-netty-message? req)
-		body
-		(let [ch (channel)]
-		  (when body
-		    (enqueue ch body))
-		  ch))))))
+      :body (if (final-netty-message? req)
+	      (-> request
+		(assoc :body (.getContent req))
+		(decode-aleph-message options)
+		:body)
+	      ::chunked))))
 
 (defn wrap-response-channel [ch]
   (proxy-channel
@@ -69,12 +66,15 @@
 	  [result [[result rsp]]])))
     ch))
 
-(defn handle-request [netty-channel req handler options]
-  (let [ch (wrap-response-channel (constant-channel))
-	req (transform-netty-request req netty-channel options)]
-    (with-thread-pool (:thread-pool options) {:timeout ((:timeout options) req)}
-      (handler ch req))
-    ch))
+(defn request-handler [handler options]
+  (let [f (executor (:pool options)
+	    (fn [netty-channel req]
+	        (let [ch (wrap-response-channel (constant-channel))
+		      req (transform-netty-request req netty-channel options)]
+		  (handler ch req)
+		  (read-channel ch)))
+	    options)]
+    #(f [%1 %2])))
 
 (defn consume-request-stream [netty-channel in handler options]
   (let [[a b] (channel-pair)
@@ -88,7 +88,7 @@
 	(let [keep-alive? (HttpHeaders/isKeepAlive req)
 	      req (transform-netty-request req netty-channel options)
 	      req (assoc req :keep-alive? keep-alive?)]
-	  (if-not (-> req :body channel?)
+	  (if-not (= ::chunked (:body req))
 	    (do
 	      (enqueue a req)
 	      keep-alive?)
@@ -96,11 +96,9 @@
 			   (take-while* #(instance? HttpChunk %))
 			   (map* #(if (final-netty-message? %)
 				    ::last
-				    (-> req
-				      (assoc :body (.getContent ^HttpChunk %))
-				      (decode-aleph-message options)
-				      :body)))
-			   (take-while* #(not= ::last %)))]
+				    (.getContent ^HttpChunk %)))
+			   (take-while* #(not= ::last %)))
+		  chunks (map* #(-> req (assoc :body %) (decode-aleph-message options) :body) chunks)]
 	      (enqueue a (assoc req :body chunks))
 	      (run-pipeline (closed-result chunks)
 		(fn [_]

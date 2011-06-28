@@ -39,14 +39,13 @@
       nil)))
 
 (defn udp-pipeline-factory
-  [ch frame & intermediate-stages]
+  [ch frame options & intermediate-stages]
   (reify ChannelPipelineFactory
     (getPipeline [_]
-      (apply create-netty-pipeline
+      (apply create-netty-pipeline (:name options)
 	(concat
 	  intermediate-stages
-	  [:upstream-error (upstream-stage error-stage-handler)
-	   :receive (udp-message-stage
+	  [:receive (udp-message-stage
 		      (fn [msg addr]
 			(let [msg (cond
 				    frame
@@ -57,8 +56,7 @@
 
 				    :else
 				    msg)]
-			  (enqueue ch (assoc addr :message msg)))))
-	   :downstream-error (downstream-stage error-stage-handler)])))))
+			  (enqueue ch (assoc addr :message msg)))))])))))
 
 (defn udp-socket
   "Returns a result-channel that emits a channel if it successfully opens
@@ -96,7 +94,11 @@
 		     (assoc netty-opts "receiveBufferSize" buf-size)
 		     netty-opts)
 	inner (wrap-write-channel inner)]
-    (.setPipelineFactory client (apply udp-pipeline-factory outer (or decoder frame) stages))
+    (.setPipelineFactory client (apply udp-pipeline-factory
+				  outer
+				  (or decoder frame)
+				  options
+				  stages))
 
     (doseq [[k v] netty-opts]
       (.setOption client k v))
@@ -105,22 +107,23 @@
       (fn [netty-channel]
 	(let [write-queue (create-write-queue netty-channel
 			    #(write-to-channel netty-channel nil true))]
-	  (run-pipeline
-	    (receive-in-order outer
-	      (fn [[returned-result {:keys [host port message]}]]
-		(enqueue write-queue
-		  (let [message (if-let [encoder (or encoder frame)]
-				  (byte-buffers->channel-buffer (encode encoder message))
-				  message)
-			result (write-to-channel netty-channel message false
-				 :host host
-				 :port port)]
-		    (siphon-result result returned-result)
-		    result))
-		nil))
+	  (run-pipeline nil
 	    :error-handler (fn [ex]
-			     (log/error "Error in handler, closing connection." ex)
+			     
 			     (close write-queue))
+	    (fn [_]
+	      (receive-in-order outer
+		(fn [[returned-result {:keys [host port message]}]]
+		  (enqueue write-queue
+		    (let [message (if-let [encoder (or encoder frame)]
+				    (byte-buffers->channel-buffer (encode encoder message))
+				    message)
+			  result (write-to-channel netty-channel message false
+				   :host host
+				   :port port)]
+		      (siphon-result result returned-result)
+		      result))
+		  nil)))
 	    (fn [_]
 	      (close write-queue))))
         inner))))
