@@ -46,12 +46,13 @@
   (.getTextData frame))
 
 (defn to-websocket-frame [msg]
-  (DefaultWebSocketFrame. 0 (to-channel-buffer msg)))
+  (DefaultWebSocketFrame. 0 (bytes->channel-buffer msg)))
 
 (defn websocket-handshake? [^HttpRequest request]
-  (and
-    (= "upgrade" (.toLowerCase (.getHeader request "connection")))
-    (= "websocket" (.toLowerCase (.getHeader request "upgrade")))))
+  (let [connection-header (.getHeader request "connection") ]
+    (and connection-header
+         (= "upgrade" (.toLowerCase connection-header))
+         (= "websocket" (.toLowerCase (.getHeader request "upgrade"))))))
 
 (defn transform-key [k]
   (/
@@ -72,7 +73,7 @@
 	     (doto (ByteBuffer/allocate 16)
 	       (.putInt (transform-key (headers "sec-websocket-key1")))
 	       (.putInt (transform-key (headers "sec-websocket-key2")))
-	       (.putLong (-> request :body contiguous .getLong))))}))
+	       (.putLong (-> request :body .readLong))))}))
 
 (defn standard-websocket-response [request]
   (let [headers (:headers request)]

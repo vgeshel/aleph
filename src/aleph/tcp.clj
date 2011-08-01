@@ -32,13 +32,6 @@
     [java.io
      InputStream]))
 
-(defn create-frame [frame delimiters strip-delimiters?]
-  (cond
-    (and frame delimiters) (delimited-frame delimiters frame)
-    (and frame (not delimiters)) (compile-frame frame)
-    (and (not frame) delimiters) (delimited-block delimiters (or strip-delimiters? true))
-    :else nil))
-
 (defn basic-server-pipeline
   [handler send-encoder receive-encoder options]
   (let [[inner outer] (channel-pair)
@@ -141,7 +134,7 @@
    bytes are no longer an acceptable input)."
   [handler options]
   (let [options (merge
-		  {:name (str "tcp-server." (:port options))}
+		  {:name (str "tcp-server:" (:port options))}
 		  options)]
     (start-server
       (fn []
@@ -161,7 +154,7 @@
    start-tcp-server."
   [options]
   (let [options (merge
-		  {:name (str "tcp-client." (:host options) ":" (:port options) ".")}
+		  {:name (str "tcp-client:" (:host options) ":" (:port options))}
 		  options)
 	encoder (create-frame
 		  (or (:encoder options) (:frame options))

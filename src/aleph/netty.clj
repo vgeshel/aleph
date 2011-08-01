@@ -11,7 +11,8 @@
   (:use
     [clojure.contrib.def :only (defvar- defmacro-)]
     [lamina core trace api]
-    [aleph formats core])
+    [aleph formats core]
+    [gloss core])
   (:require
     [clj-http.client :as client]
     [clojure.contrib.logging :as log])
@@ -48,10 +49,13 @@
      Executor]
     [java.net
      URI
+     SocketAddress
      InetSocketAddress
      InetAddress]
     [java.io
      InputStream]
+    [java.nio.channels
+     ClosedChannelException]
     [java.nio
      ByteBuffer]))
 
@@ -72,7 +76,7 @@
   (when (instance? ChannelEvent evt)
     (.getChannel ^ChannelEvent evt)))
 
-(defn event-origin
+(defn ^InetSocketAddress event-origin
   "Returns origin of message event, or nil if it's a different type of message."
   [evt]
   (when (instance? MessageEvent evt)
@@ -169,17 +173,18 @@
 	error-probe (canonical-probe [pipeline-name :errors])
 	_ (register-probe error-probe)
 	error-handler (fn [evt]
-			(when-let [ex (exception-event evt)]
-			  (when-not (trace* error-probe ex)
-			    (.printStackTrace ex)
-			    (log/error ex))
+			(when-let [ex ^ExceptionEvent (exception-event evt)]
+			  (when-not (instance? ClosedChannelException ex)
+			    (when-not (trace error-probe
+					{:exception ex
+					 :address (-> ex .getChannel channel-origin)})
+			      (log/error nil ex)))
 			  nil))
 	traffic-handler (fn [probe-suffix]
-			  (let [canonical (canonical-probe [pipeline-name :traffic probe-suffix])]
-			    (register-probe canonical)
+			  (let [traffic-probe (canonical-probe [pipeline-name :traffic probe-suffix])]
 			    (fn [evt]
 			      (when-let [msg (message-event evt)]
-				(trace* canonical
+				(trace traffic-probe
 				  {:address (-> evt channel-event channel-origin)
 				   :bytes (.readableBytes ^ChannelBuffer msg)}))
 			      nil)))]
@@ -194,6 +199,15 @@
     (.addFirst netty-pipeline "incoming-error"
       (upstream-stage error-handler))
     netty-pipeline))
+
+;;;
+
+(defn create-frame [frame delimiters strip-delimiters?]
+  (cond
+    (and frame delimiters) (delimited-frame delimiters frame)
+    (and frame (not delimiters)) (compile-frame frame)
+    (and (not frame) delimiters) (delimited-block delimiters (or strip-delimiters? true))
+    :else nil))
 
 ;;;
 
@@ -268,10 +282,8 @@
 
 (defn create-pipeline-factory
   [^ChannelGroup channel-group options
-   canonical-connections-probe refuse-connections?
+   connections-probe refuse-connections?
    pipeline-fn & args]
-  (when canonical-connections-probe
-    (register-probe canonical-connections-probe))
   (let [connection-count (atom 0)]
     (reify ChannelPipelineFactory
       (getPipeline [_]
@@ -287,7 +299,7 @@
 		      (when (.add channel-group ch)
 			(let [origin (channel-origin ch)
 			      connections (swap! connection-count inc)]
-			  (trace* canonical-connections-probe
+			  (trace connections-probe
 			    {:event :opened
 			     :connections connections
 			     :address origin})
@@ -295,7 +307,7 @@
 			    wrap-netty-channel-future
 			    (fn [_]
 			      (let [connections (swap! connection-count dec)]
-				(trace* canonical-connections-probe
+				(trace connections-probe
 				  {:event :closed
 				   :connections connections
 				   :address origin}))))))))
@@ -352,7 +364,7 @@
     ;; add parent channel to channel-group
     (.add channel-group (.bind server (InetSocketAddress. port)))
 
-    ;; create server instance
+     ;; create server instance
     (reify AlephServer
       (stop-server-immediately [_]
 	(trace [(:name options) :shutdown]
@@ -361,7 +373,7 @@
 	  (.close channel-group)
 	  wrap-netty-channel-group-future
 	  (fn [_]
-	    (task (.releaseExternalResources server)))))
+	    (future (.releaseExternalResources server)))))
       (stop-server [this timeout]
 	(reset! refuse-connections? true)
 	(graceful-shutdown this timeout))
@@ -439,7 +451,7 @@
 	      (run-pipeline
 		(.close channel-group)
 		wrap-netty-channel-group-future
-		(fn [_] (task (.releaseExternalResources client))))))
+		(fn [_] (future (.releaseExternalResources client))))))
 	  (.add channel-group netty-channel)
 	  (run-pipeline
 	    (receive-in-order outer

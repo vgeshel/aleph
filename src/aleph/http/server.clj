@@ -31,7 +31,9 @@
      HttpContentCompressor]
     [org.jboss.netty.channel
      Channel
-     ChannelPipeline]))
+     ChannelPipeline]
+    [java.util.concurrent
+     TimeoutException]))
 
 
 ;;;
@@ -39,10 +41,16 @@
 (def continue-response
   (DefaultHttpResponse. HttpVersion/HTTP_1_1 HttpResponseStatus/CONTINUE))
 
+(def error-response
+  (transform-aleph-response {:status 500} nil))
+
+(def timeout-response
+  (transform-aleph-response {:status 408} nil))
+
 (defn http-session-handler [handler options]
   (let [init? (atom false)
- 	ch (channel)
 	server-name (:name options)
+	ch (channel)
 	simple-handler (request-handler handler options)]
     (message-stage
       (fn [^Channel netty-channel request]
@@ -53,16 +61,27 @@
 	(if-not (or @init? (.isChunked ^HttpRequest request) (HttpHeaders/isKeepAlive request))
 	  (run-pipeline (simple-handler netty-channel request)
 	    :error-handler (fn [ex]
-			     (when-not (trace [server-name :errors] ex)
-			       (log/error "Error in handler, closing connection" ex))
-			     (.close netty-channel))
+			     (let [response (if (or
+						  (instance? InterruptedException ex)
+						  (instance? TimeoutException ex))
+					      timeout-response
+					      error-response)]
+			       (write-to-channel netty-channel response true)))
 	    #(respond netty-channel options (first %) (second %))
 	    (fn [_] (.close netty-channel)))
 	  (do
 	    (when (compare-and-set! init? false true)
 	      (run-pipeline
 		(receive-in-order (consume-request-stream netty-channel ch handler options)
-		  #(respond netty-channel options (first %) (second %)))
+		  (fn [{:keys [request response]}]
+		    (if (instance? Exception response)
+		      (let [response (if (or
+					   (instance? InterruptedException response)
+					   (instance? TimeoutException response))
+				       timeout-response
+				       error-response)]
+			(write-to-channel netty-channel response (not (:keep-alive? request))))
+		      (respond netty-channel options (first response) (second response)))))
 		(fn [_] (.close netty-channel))))
 	    (enqueue ch request)))
 	nil))))
@@ -98,17 +117,17 @@
    request is a WebSocket handshake, the channel represents a full duplex socket, which
    communicates via complete (i.e. non-streaming) strings."
   [handler options]
-  (let [options (merge options {:result-transform second})
+  (let [default-name (str "http-server:" (:port options))
+	options (merge options {:result-transform second})
 	options (merge
-		  {:timeout (constantly -1)
-		   :name (str "http-server." (:port options))}
+		  {:name default-name}
 		  options
 		  {:thread-pool (when (and
 					(contains? options :thread-pool)
 					(not (nil? (:thread-pool options))))
 				  (thread-pool
 				    (merge-with #(if (map? %1) (merge %1 %2) %2)
-				      {:name (str "http-server." (:port options) ".thread-pool")}
+				      {:name (str default-name ":thread-pool")}
 				      (:thread-pool options))))})
 	stop-fn (start-server
 		  #(create-pipeline handler options)
