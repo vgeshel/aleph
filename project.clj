@@ -5,7 +5,7 @@
             :url "http://www.eclipse.org/legal/epl-v10.html"
             :distribution :repo}
   :dependencies [[org.clojure/clojure "1.2.0"] 
-                 [org.jboss.netty/netty "3.2.4.Final"]
+                 [org.jboss.netty/netty "3.2.5.Final"]
                  [clj-http "0.1.3"]
                  [lamina "0.4.0-beta2"]
                  [gloss "0.2.0-beta2"]
