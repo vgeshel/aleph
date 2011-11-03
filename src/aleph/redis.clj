@@ -96,7 +96,7 @@
    Messages from the stream will be of the structure {:channel \"channel-name\", :message \"message\"}.
    :message will always be a string."
   ([options]
-     (let [options (merge options {:port 6379 :charset :utf-8})
+     (let [options (merge {:port 6379 :charset :utf-8} options)
 	   control-messages (channel)
 	   stream (channel)
 	   control-message-accumulator (atom [])]
