@@ -81,19 +81,6 @@
 
 ;;;
 
-(defn- respond-with-stream
-  [^Channel netty-channel options returned-result response]
-  (let [stream ^InputStream (:body response)
-	response (transform-aleph-response
-		   (update-in response [:body] #(bytes->channel-buffer %))
-		   options)]
-    (siphon-result*
-      (write-to-channel netty-channel response false
-	:on-write #(.close stream))
-      returned-result)))
-
-;;;
-
 (defn- respond-with-file
   [netty-channel options returned-result response]
   (let [file ^File (:body response)
@@ -121,10 +108,12 @@
 			   (let [result (apply write-to-channel args)]
 			     (enqueue returned-result result)
 			     result))]
+
     (run-pipeline (.getCloseFuture netty-channel)
       wrap-netty-channel-future
       (fn [_]
 	(close ch)))
+
     (run-pipeline (let [result (write-to-channel netty-channel initial-response false)]
 		    (enqueue returned-result result)
 		    result)
@@ -132,11 +121,11 @@
 	(receive-in-order
 	  (map*
 	    #(-> response
-	       (assoc :body %)
-	       (encode-aleph-message options)
-	       :body
-	       bytes->channel-buffer
-	       DefaultHttpChunk.)
+               (assoc :body %)
+               (encode-aleph-message options)
+               :body
+               bytes->channel-buffer
+               DefaultHttpChunk.)
 	    ch)
 	  (fn [msg]
 	    (enqueue returned-result (write-to-channel netty-channel msg false))
@@ -144,6 +133,15 @@
       (fn [_]
 	(enqueue-and-close returned-result
 	  (write-to-channel netty-channel HttpChunk/LAST_CHUNK false))))))
+
+;;;
+
+(defn- respond-with-stream
+  [^Channel netty-channel options returned-result response]
+  (let [stream ^InputStream (:body response)
+	ch (input-stream->channel stream (or (:chunk-size response) (:chunk-size options) 8192))]
+    (on-closed ch #(.close stream))
+    (respond-with-channel netty-channel options returned-result (assoc response :body ch))))
 
 ;;;
 
