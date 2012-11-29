@@ -1,8 +1,4 @@
-<<<<<<< HEAD
-(defproject com.vgeshel/aleph "0.3.0-SNAPSHOT"
-=======
 (defproject aleph "0.3.0-SNAPSHOT"
->>>>>>> refs/remotes/ztellman/perf
   :description "a framework for asynchronous communication"
   :repositories {"jboss" "http://repository.jboss.org/nexus/content/groups/public/"
                  "sonatype-oss-public" "https://oss.sonatype.org/content/groups/public/"}
