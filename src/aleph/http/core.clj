@@ -40,6 +40,8 @@
      Channel]
     [org.jboss.netty.buffer
      ChannelBuffers]
+    [java.nio
+     ByteBuffer]
     [java.nio.channels
      FileChannel
      FileChannel$MapMode]
@@ -242,13 +244,20 @@
 
 ;;;
 
+(defrecord LazyDelay [delay]
+  clojure.lang.IDeref
+  (deref [_] @delay))
+
+(defmacro delay* [& body]
+  `(LazyDelay. (delay ~@body)))
+
 (def-custom-map LazyMap
   :get
   (fn [_ data _ key default-value]
     `(if-not (contains? ~data ~key)
        ~default-value
        (let [val# (get ~data ~key)]
-         (if (delay? val#)
+         (if (instance? LazyDelay val#)
            @val#
            val#)))))
 
@@ -260,16 +269,16 @@
         request (lazy-map
                   :scheme :http
                   :keep-alive? (HttpHeaders/isKeepAlive netty-request)
-                  :remote-addr (delay (netty/channel-remote-host-address netty-channel))
-                  :server-name (delay (netty/channel-local-host-address netty-channel))
-                  :server-port (delay (netty/channel-local-port netty-channel))
-                  :request-method (delay (request-method netty-request))
-                  :headers (delay (http-headers netty-request))
-                  :content-type (delay (http-content-type netty-request))
-                  :character-encoding (delay (http-character-encoding netty-request))
-                  :uri (delay (request-uri netty-request))
-                  :query-string (delay (request-query-string netty-request))
-                  :content-length (delay (http-content-length netty-request)))]
+                  :remote-addr (delay* (netty/channel-remote-host-address netty-channel))
+                  :server-name (delay* (netty/channel-local-host-address netty-channel))
+                  :server-port (delay* (netty/channel-local-port netty-channel))
+                  :request-method (delay* (request-method netty-request))
+                  :headers (delay* (http-headers netty-request))
+                  :content-type (delay* (http-content-type netty-request))
+                  :character-encoding (delay* (http-character-encoding netty-request))
+                  :uri (delay* (request-uri netty-request))
+                  :query-string (delay* (request-query-string netty-request))
+                  :content-length (delay* (http-content-length netty-request)))]
     (if chunks
       (assoc request
         :body (map* #(.getContent ^HttpChunk %) chunks))
@@ -281,11 +290,11 @@
 (defn netty-response->ring-map [{netty-response :msg, chunks :chunks}]
   (let [response (lazy-map
                    :keep-alive? (HttpHeaders/isKeepAlive netty-response)
-                   :headers (delay (http-headers netty-response))
-                   :character-encoding (delay (http-character-encoding netty-response))
-                   :content-type (delay (http-content-type netty-response))
-                   :content-length (delay (http-content-length netty-response))
-                   :status (delay (response-code netty-response)))]
+                   :headers (delay* (http-headers netty-response))
+                   :character-encoding (delay* (http-character-encoding netty-response))
+                   :content-type (delay* (http-content-type netty-response))
+                   :content-length (delay* (http-content-length netty-response))
+                   :status (delay* (response-code netty-response)))]
     (if chunks
       (assoc response
         :body (map* #(.getContent ^HttpChunk %) chunks))
@@ -323,10 +332,10 @@
 
       (instance? File body)
       (let [fc (.getChannel (RandomAccessFile. ^File body "r"))
-            buf (-> fc
-                  (.map FileChannel$MapMode/READ_ONLY 0 (.size fc))
-                  ChannelBuffers/wrappedBuffer)]
-        (.setContent msg buf)
+            buf (ByteBuffer/allocate (.size fc))]
+        (.read fc buf)
+        (.rewind buf)
+        (.setContent msg (ChannelBuffers/wrappedBuffer buf))
         (HttpHeaders/setContentLength msg (.size fc))
         {:msg msg
          :write-callback #(.close fc)})

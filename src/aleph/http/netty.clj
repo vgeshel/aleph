@@ -110,6 +110,7 @@
           (when (options/websocket? options)
             (.addBefore pipeline "handler" "websocket"
               (ws/server-handshake-stage handler)))
+          ((get netty-options "pipeline-transform" identity) pipeline)
           pipeline))
       options)))
 
@@ -141,7 +142,14 @@
                       (map* http/decode-message responses)
                       responses)
           responses (if-let [frame (formats/options->decoder options)]
-                      (formats/decode-channel frame responses)
+                      (map*
+                        (fn [rsp]
+                          (update-in rsp [:body]
+                            #(let [body (if (channel? %)
+                                          %
+                                          (closed-channel %))]
+                               (formats/decode-channel frame body))))
+                        responses)
                       responses)]
       (splice responses requests))))
 
