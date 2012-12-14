@@ -1,4 +1,4 @@
-(defproject com.vgeshel/aleph "0.3.0-vg"
+(defproject com.vgeshel/aleph "0.3.0-vg1"
   :description "a framework for asynchronous communication"
   :repositories {"jboss" "http://repository.jboss.org/nexus/content/groups/public/"
                  "sonatype-oss-public" "https://oss.sonatype.org/content/groups/public/"}
@@ -9,7 +9,7 @@
                  [org.clojure/tools.logging "0.2.3"]
                  [org.clojure/data.xml "0.0.6"]
                  [io.netty/netty "3.5.8.Final"]
-                 [lamina "0.5.0-beta7"]
+                 [lamina "0.5.0-beta8"]
                  [gloss "0.2.2-beta3"]
                  [cheshire "4.0.1"]
                  [criterium "0.3.0"]
