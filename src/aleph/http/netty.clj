@@ -151,8 +151,10 @@
                                           (closed-channel %))]
                                (formats/decode-channel frame body))))
                         responses)
-                      responses)]
-      (splice responses requests))))
+                      responses)
+          ret (splice responses requests)]
+      (on-closed ret (fn [] (.close netty-channel)))
+      ret)))
 
 (defn-instrumented http-connection-
   {:name "aleph:http-connection"}
