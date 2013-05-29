@@ -199,20 +199,28 @@
   (let [request (assoc request :keep-alive? false)
         start (System/currentTimeMillis)
         duration (fn [] (- (System/currentTimeMillis) start))
-        elapsed (atom nil)]
+        elapsed (atom nil)
+        sent (atom nil)
+        received (atom nil)
+        receive-timeout (atom nil)]
     (run-pipeline request
       {:error-handler (fn [ex]
                         (when (= :lamina/timeout! ex)
                           (if-let [elapsed @elapsed]
-                            (complete (TimeoutException. (format "HTTP request timed out after %d ms, took %d ms to connect"
+                            (complete (TimeoutException. (format "HTTP request timed out after %d ms, took %d ms to connect, req sent after %s, resp received after %s, timeout was %s"
                                                                  (duration)
-                                                                 elapsed)))
+                                                                 elapsed
+                                                                 @sent
+                                                                 @received
+                                                                 @receive-timeout)))
                             (complete (TimeoutException. "HTTP request timed out trying to establish connection")))))}
       http-connection
       (fn [ch]
-        (reset! elapsed (- (System/currentTimeMillis) start))
+        (reset! elapsed (duration))
+        (when timeout
+          (reset! receive-timeout (- timeout @elapsed)))
         (run-pipeline ch
-          {:timeout (when timeout (- timeout @elapsed))
+          {:timeout @receive-timeout
            :error-handler (fn [ex]
                             ;; TODO: remove
                             (log/errorf "error consuming HTTP response, after %d ms: %s"
@@ -221,8 +229,10 @@
                             (close ch))}
           (fn [ch]
             (enqueue ch request)
+            (reset! sent (duration))
             (read-channel ch))
           (fn [rsp]
+            (reset! received (duration))
             (if (channel? (:body rsp))
               (on-closed (:body rsp) #(close ch))
               (close ch))
