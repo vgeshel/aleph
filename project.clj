@@ -1,4 +1,4 @@
-(defproject com.vgeshel/aleph "0.3.0-beta16-vg-SNAPSHOT"
+(defproject com.vgeshel/aleph "0.3.0-rc1-vg-SNAPSHOT"
   :description "a framework for asynchronous communication"
   :repositories {"jboss" "http://repository.jboss.org/nexus/content/groups/public/"
                  "sonatype-oss-public" "https://oss.sonatype.org/content/groups/public/"}
@@ -7,10 +7,10 @@
             :distribution :repo}
   :dependencies [[org.clojure/tools.logging "0.2.3"]
                  [org.clojure/data.xml "0.0.7"]
-                 [io.netty/netty "3.6.2.Final"]
-                 [lamina "0.5.0-beta15"]
-                 [gloss "0.2.2-beta5"]
-                 [potemkin "0.2.1"]
+                 [io.netty/netty "3.6.5.Final"]
+                 [lamina "0.5.0-rc1"]
+                 [gloss "0.2.2-rc1"]
+                 [potemkin "0.2.2"]
                  [cheshire "5.0.1"]
                  [commons-codec/commons-codec "1.7"]
                  [org.apache.commons/commons-compress "1.4.1"]]

@@ -14,7 +14,8 @@
     [clojure.tools.logging :as log])
   (:import
     [java.util.concurrent
-     Executors]
+     Executors
+     ThreadFactory]
     [org.jboss.netty.channel
      ChannelPipeline
      ChannelUpstreamHandler
@@ -83,11 +84,23 @@
    "readWriteFair" true,
    "connectTimeoutMillis" 3000})
 
+(def thread-factory
+  (reify ThreadFactory
+    (newThread [_ runnable]
+      (doto
+        (Thread.
+          (fn []
+            (try
+              (.run ^Runnable runnable)
+              (catch Throwable e
+                (log/error e (str "error in I/O thread"))))))
+        (.setDaemon true)))))
+
 (def channel-factory
   (delay
     (NioClientSocketChannelFactory. 
-      (Executors/newCachedThreadPool)
-      (Executors/newCachedThreadPool))))
+      (Executors/newCachedThreadPool thread-factory)
+      (Executors/newCachedThreadPool thread-factory))))
 
 (defn client-message-handler [ch options]
   (let [latch (atom false)]
@@ -100,31 +113,37 @@
           (.set local-options options)
 
           ;; handle initial setup
-          (when (compare-and-set! latch false true)
+          (try
 
-            (on-error ch
-              (fn [ex]
-                (log/error ex)
-                (.close netty-channel)))
+            (when (compare-and-set! latch false true)
 
-            ;; set up write handling
-            (receive-all ch
-              #(wrap-netty-channel-future (.write netty-channel %)))
+             (on-error ch
+               (fn [ex]
+                 (log/error ex)
+                 (.close netty-channel)))
+
+             ;; set up write handling
+             (receive-all ch
+               #(wrap-netty-channel-future (.write netty-channel %)))
             
-            ;; lamina -> netty
-            (on-drained ch
-              #(.close netty-channel))
+             ;; lamina -> netty
+             (on-drained ch
+               #(.close netty-channel))
             
-            ;; netty -> lamina
-            (run-pipeline (.getCloseFuture netty-channel)
-              wrap-netty-channel-future
-              (fn [_]
-                (close ch)))))
-        
-        ;; handle messages
-        (if-let [msg (event-message evt)]
-          (enqueue ch msg)
-          (.sendUpstream ctx evt))))))
+             ;; netty -> lamina
+             (run-pipeline (.getCloseFuture netty-channel)
+               wrap-netty-channel-future
+               (fn [_]
+                 (close ch))))
+
+            ;; handle messages
+            (if-let [msg (event-message evt)]
+              (enqueue ch msg)
+              (.sendUpstream ctx evt))
+
+            ;; don't hold onto the channel
+            (finally
+              (.set local-channel nil))))))))
 
 ;;;
 
