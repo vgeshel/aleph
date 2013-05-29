@@ -35,7 +35,8 @@
      HttpContentDecompressor
      HttpClientCodec]
     [org.jboss.netty.handler.timeout
-     ReadTimeoutHandler]
+     ReadTimeoutHandler
+     WriteTimeoutHandler]
     [java.nio.channels
      ClosedChannelException]))
 
@@ -158,7 +159,8 @@
       (on-closed ret (fn [] (.close netty-channel)))
       ret)))
 
-(def ^{:private true} timer (org.jboss.netty.util.HashedWheelTimer.))
+(def ^{:private true} timer
+  (org.jboss.netty.util.HashedWheelTimer. 10 TimeUnit/MILLISECONDS))
 
 (defn-instrumented http-connection-
   {:name "aleph:http-connection"}
@@ -176,10 +178,19 @@
         (create-client
           client-name
           (fn [channel-group]
-           (create-netty-pipeline client-name false channel-group
-              :timeout (ReadTimeoutHandler. timer (long (or timeout 0)) TimeUnit/MILLISECONDS)
-              :codec (HttpClientCodec.)
-              :inflater (HttpContentDecompressor.)))
+            (create-netty-pipeline client-name false channel-group
+                                   :read-timeout (ReadTimeoutHandler. timer
+                                                                      (long (or (:read-timeout options)
+                                                                                timeout
+                                                                                0))
+                                                                      TimeUnit/MILLISECONDS)
+                                   :write-timeout (WriteTimeoutHandler. timer
+                                                                        (long (or (:write-timeout options)
+                                                                                  timeout
+                                                                                  0))
+                                                                        TimeUnit/MILLISECONDS)
+                                   :codec (HttpClientCodec.)
+                                   :inflater (HttpContentDecompressor.)))
           options))
       (fn [connection]
         (let [ch (wrap-http-client-channel options connection)]
