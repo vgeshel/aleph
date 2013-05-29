@@ -202,9 +202,12 @@
         elapsed (atom nil)
         sent (atom nil)
         received (atom nil)
-        receive-timeout (atom nil)]
+        receive-timeout (atom nil)
+        ch-atom (atom nil)]
     (run-pipeline request
       {:error-handler (fn [ex]
+                        (when-let [ch @ch-atom]
+                          (close ch))
                         (when (= :lamina/timeout! ex)
                           (if-let [elapsed @elapsed]
                             (complete (TimeoutException. (format "HTTP request timed out after %d ms, took %d ms to connect, req sent after %s, resp received after %s, timeout was %s"
@@ -219,6 +222,7 @@
         (reset! elapsed (duration))
         (when timeout
           (reset! receive-timeout (- timeout @elapsed)))
+        (reset! ch-atom ch)
         (run-pipeline ch
           {:timeout @receive-timeout
            :error-handler (fn [ex]
