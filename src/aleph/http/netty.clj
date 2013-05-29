@@ -250,7 +250,9 @@
           (fn [ch]
             (enqueue ch request)
             (reset! sent (duration))
-            (read-channel ch))
+            (read-channel ch)
+            (on-drained ch (fn []
+                             (log/warnf "drained"))))
           (fn [rsp]
             (reset! received (duration))
             (if (channel? (:body rsp))
