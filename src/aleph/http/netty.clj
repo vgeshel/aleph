@@ -198,19 +198,27 @@
   [request timeout]
   (let [request (assoc request :keep-alive? false)
         start (System/currentTimeMillis)
+        duration (fn [] (- (System/currentTimeMillis) start))
         elapsed (atom nil)]
     (run-pipeline request
       {:error-handler (fn [ex]
                         (when (= :lamina/timeout! ex)
                           (if-let [elapsed @elapsed]
-                            (complete (TimeoutException. (str "HTTP request timed out, took " elapsed "ms to connect")))
+                            (complete (TimeoutException. (format "HTTP request timed out after %d ms, took %d ms to connect"
+                                                                 (duration)
+                                                                 elapsed)))
                             (complete (TimeoutException. "HTTP request timed out trying to establish connection")))))}
       http-connection
       (fn [ch]
         (reset! elapsed (- (System/currentTimeMillis) start))
         (run-pipeline ch
           {:timeout (when timeout (- timeout @elapsed))
-           :error-handler (fn [ex] (close ch))}
+           :error-handler (fn [ex]
+                            ;; TODO: remove
+                            (log/errorf "error consuming HTTP response, after %d ms: %s"
+                                        (duration)
+                                        ex)
+                            (close ch))}
           (fn [ch]
             (enqueue ch request)
             (read-channel ch))
