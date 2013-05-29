@@ -1,4 +1,4 @@
-(defproject com.vgeshel/aleph "0.3.0-beta16-vg5"
+(defproject com.vgeshel/aleph "0.3.0-beta16-vg6"
   :description "a framework for asynchronous communication"
   :repositories {"jboss" "http://repository.jboss.org/nexus/content/groups/public/"
                  "sonatype-oss-public" "https://oss.sonatype.org/content/groups/public/"}
