@@ -23,7 +23,7 @@
     [clojure.tools.logging :as log])
   (:import
     [java.util.concurrent
-     TimeoutException]
+     TimeoutException TimeUnit]
     [org.jboss.netty.handler.codec.http
      HttpHeaders
      DefaultHttpChunk
@@ -34,6 +34,8 @@
      HttpContentCompressor
      HttpContentDecompressor
      HttpClientCodec]
+    [org.jboss.netty.handler.timeout
+     ReadTimeoutHandler]
     [java.nio.channels
      ClosedChannelException]))
 
@@ -156,6 +158,8 @@
       (on-closed ret (fn [] (.close netty-channel)))
       ret)))
 
+(def ^{:private true} timer (org.jboss.netty.util.HashedWheelTimer.))
+
 (defn-instrumented http-connection-
   {:name "aleph:http-connection"}
   [options timeout]
@@ -173,6 +177,7 @@
           client-name
           (fn [channel-group]
            (create-netty-pipeline client-name false channel-group
+              :timeout (ReadTimeoutHandler. timer (long (or timeout 0)) TimeUnit/MILLISECONDS)
               :codec (HttpClientCodec.)
               :inflater (HttpContentDecompressor.)))
           options))
