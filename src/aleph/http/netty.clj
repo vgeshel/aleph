@@ -23,7 +23,7 @@
     [clojure.tools.logging :as log])
   (:import
     [java.util.concurrent
-     TimeoutException TimeUnit]
+     TimeoutException]
     [org.jboss.netty.handler.codec.http
      HttpHeaders
      DefaultHttpChunk
@@ -34,9 +34,6 @@
      HttpContentCompressor
      HttpContentDecompressor
      HttpClientCodec]
-    [org.jboss.netty.handler.timeout
-     ReadTimeoutHandler
-     WriteTimeoutHandler]
     [java.nio.channels
      ClosedChannelException]))
 
@@ -119,26 +116,11 @@
 
 ;;;
 
-(defn- log-drained [req-info label ch]
-  (on-drained ch (fn []
-                   (try
-                     (log/warnf "drained: %s/%s" (:id @req-info) label)
-                     (throw (RuntimeException.))
-                     (catch Exception e
-                       (swap! req-info
-                              assoc-in
-                              [:drains label]
-                              {:ts (System/currentTimeMillis)
-                               :stack e})))))
-  ch)
-
 (defn wrap-http-client-channel [options ch]
   (let [netty-channel (netty/network-channel->netty-channel ch)
         requests (channel)
         options (client/expand-client-options options)
-        auto-decode? (options/auto-decode? options)
-        req-info (::info options)
-        log-drained (partial log-drained req-info)]
+        auto-decode? (options/auto-decode? options)]
 
     ;; transform requests
     (join
@@ -154,35 +136,25 @@
 
     ;; transform responses
     (let [responses (->> ch
-                         (log-drained 1)
-                         (http/collapse-reads netty-channel)
-                         (log-drained 2)
-                         (map* http/netty-response->ring-map)
-                         (log-drained 3)
-                         (map* #(dissoc % :keep-alive?))
-                         (log-drained 4))
+                      (http/collapse-reads netty-channel)
+                      (map* http/netty-response->ring-map)
+                      (map* #(dissoc % :keep-alive?)))
           responses (if auto-decode?
-                      (log-drained 5 (map* http/decode-message responses))
+                      (map* http/decode-message responses)
                       responses)
           responses (if-let [frame (formats/options->decoder options)]
-                      (log-drained
-                       6
-                       (map*
+                      (map*
                         (fn [rsp]
                           (update-in rsp [:body]
-                                     #(let [body (if (channel? %)
-                                                   %
-                                                   (closed-channel %))]
-                                        (formats/decode-channel frame body))))
-                        responses))
+                            #(let [body (if (channel? %)
+                                          %
+                                          (closed-channel %))]
+                               (formats/decode-channel frame body))))
+                        responses)
                       responses)
-          ret (splice responses requests)]
-      (on-closed ret (fn [] (.close netty-channel)))
-      (log-drained 7 ret)
-      ret)))
-
-(def ^{:private true} timer
-  (org.jboss.netty.util.HashedWheelTimer. 10 TimeUnit/MILLISECONDS))
+          requests+responses (splice responses requests)]
+      (on-closed requests+responses (fn [_] (.close netty-channel)))
+      requests+responses)))
 
 (defn-instrumented http-connection-
   {:name "aleph:http-connection"}
@@ -200,19 +172,9 @@
         (create-client
           client-name
           (fn [channel-group]
-            (create-netty-pipeline client-name false channel-group
-                                   :read-timeout (ReadTimeoutHandler. timer
-                                                                      (long (or (:read-timeout options)
-                                                                                timeout
-                                                                                0))
-                                                                      TimeUnit/MILLISECONDS)
-                                   :write-timeout (WriteTimeoutHandler. timer
-                                                                        (long (or (:write-timeout options)
-                                                                                  timeout
-                                                                                  0))
-                                                                        TimeUnit/MILLISECONDS)
-                                   :codec (HttpClientCodec.)
-                                   :inflater (HttpContentDecompressor.)))
+           (create-netty-pipeline client-name false channel-group
+              :codec (HttpClientCodec.)
+              :inflater (HttpContentDecompressor.)))
           options))
       (fn [connection]
         (let [ch (wrap-http-client-channel options connection)]
@@ -231,66 +193,28 @@
 (defn pipelined-http-client [options]
   (pipelined-client #(http-connection options)))
 
-(defonce counter (atom 0))
-
 (defn-instrumented http-request-
   {:name "aleph:http-request"}
   [request timeout]
   (let [request (assoc request :keep-alive? false)
         start (System/currentTimeMillis)
-        duration (fn [] (- (System/currentTimeMillis) start))
-        elapsed (atom nil)
-        sent (atom nil)
-        received (atom nil)
-        receive-timeout (atom nil)
-        ch-atom (atom nil)
-        req-info (atom {:id (swap! counter inc)})
-        request (assoc request ::info req-info)]
-    (log/infof "starting %s" @req-info)
+        elapsed (atom nil)]
     (run-pipeline request
       {:error-handler (fn [ex]
-                        (when-let [ch @ch-atom]
-                          (close ch))
-                        (when-let [drains (:drains @req-info)]
-                          (let [drains (sort-by (comp :ts second) drains)
-                                [label {:keys [stack ts]}] (last drains)]
-                            (log/errorf stack "failed request %s: drain %s" (:id @req-info "no-id") (or label "no-label"))))
                         (when (= :lamina/timeout! ex)
                           (if-let [elapsed @elapsed]
-                            (complete (TimeoutException. (format "HTTP request %s timed out after %d ms, took %d ms to connect, req sent after %s, resp received after %s, timeout was %s"
-                                                                 (:id @req-info)
-                                                                 (duration)
-                                                                 elapsed
-                                                                 @sent
-                                                                 @received
-                                                                 @receive-timeout)))
-                            (complete (TimeoutException. (format "HTTP request %s timed out trying to establish connection" (:id @req-info)))))))}
+                            (complete (TimeoutException. (str "HTTP request timed out, took " elapsed "ms to connect")))
+                            (complete (TimeoutException. "HTTP request timed out trying to establish connection")))))}
       http-connection
       (fn [ch]
-        (reset! elapsed (duration))
-        (when timeout
-          (reset! receive-timeout (- timeout @elapsed)))
-        (reset! ch-atom ch)
+        (reset! elapsed (- (System/currentTimeMillis) start))
         (run-pipeline ch
-          {:timeout @receive-timeout
-           :error-handler (fn [ex]
-                            ;; TODO: remove
-                            (log/errorf "error consuming HTTP response %s, after %d ms: %s"
-                                        (:id @req-info)
-                                        (duration)
-                                        ex)
-                            (close ch))}
+          {:timeout (when timeout (- timeout @elapsed))
+           :error-handler (fn [ex] (close ch))}
           (fn [ch]
             (enqueue ch request)
-            (reset! sent (duration))
-            (on-drained ch (fn []
-                             (when-not @received
-                               (log/warnf "drained before response is read. req-id %s after %d"
-                                          (:id @req-info)
-                                          (duration)))))
             (read-channel ch))
           (fn [rsp]
-            (reset! received (duration))
             (if (channel? (:body rsp))
               (on-closed (:body rsp) #(close ch))
               (close ch))
