@@ -119,9 +119,17 @@
 
 ;;;
 
-(defn- log-drained [req-id label ch]
+(defn- log-drained [req-info label ch]
   (on-drained ch (fn []
-                   (log/warnf "drained: %s/%s" req-id label)))
+                   (try
+                     (log/warnf "drained: %s/%s" (:id @req-info) label)
+                     (throw (RuntimeException.))
+                     (catch Exception e
+                       (swap! req-info
+                              assoc-in
+                              [:drains label]
+                              {:ts (System/currentTimeMillis)
+                               :stack e})))))
   ch)
 
 (defn wrap-http-client-channel [options ch]
@@ -129,8 +137,8 @@
         requests (channel)
         options (client/expand-client-options options)
         auto-decode? (options/auto-decode? options)
-        req-id (::counter options)
-        log-drained (partial log-drained req-id)]
+        req-info (::info options)
+        log-drained (partial log-drained req-info)]
 
     ;; transform requests
     (join
@@ -236,22 +244,27 @@
         received (atom nil)
         receive-timeout (atom nil)
         ch-atom (atom nil)
-        req-id (swap! counter inc)
-        request (assoc request ::counter req-id)]
+        req-info (atom {:id (swap! counter inc)})
+        request (assoc request ::info req-info)]
+    (log/infof "starting %s" @req-info)
     (run-pipeline request
       {:error-handler (fn [ex]
                         (when-let [ch @ch-atom]
                           (close ch))
+                        (when-let [drains (:drains @req-info)]
+                          (let [drains (sort-by (comp :ts second) drains)
+                                [label {:keys [stack ts]}] (last drains)]
+                            (log/errorf stack "failed request %s: drain %s" (:id @req-info "no-id") (or label "no-label"))))
                         (when (= :lamina/timeout! ex)
                           (if-let [elapsed @elapsed]
                             (complete (TimeoutException. (format "HTTP request %s timed out after %d ms, took %d ms to connect, req sent after %s, resp received after %s, timeout was %s"
-                                                                 req-id
+                                                                 (:id @req-info)
                                                                  (duration)
                                                                  elapsed
                                                                  @sent
                                                                  @received
                                                                  @receive-timeout)))
-                            (complete (TimeoutException. (format "HTTP request %s timed out trying to establish connection" req-id))))))}
+                            (complete (TimeoutException. (format "HTTP request %s timed out trying to establish connection" (:id @req-info)))))))}
       http-connection
       (fn [ch]
         (reset! elapsed (duration))
@@ -263,7 +276,7 @@
            :error-handler (fn [ex]
                             ;; TODO: remove
                             (log/errorf "error consuming HTTP response %s, after %d ms: %s"
-                                        req-id
+                                        (:id @req-info)
                                         (duration)
                                         ex)
                             (close ch))}
@@ -272,7 +285,9 @@
             (reset! sent (duration))
             (on-drained ch (fn []
                              (when-not @received
-                               (log/warnf "drained before response is read. req-id %s after %d" req-id (duration)))))
+                               (log/warnf "drained before response is read. req-id %s after %d"
+                                          (:id @req-info)
+                                          (duration)))))
             (read-channel ch))
           (fn [rsp]
             (reset! received (duration))
