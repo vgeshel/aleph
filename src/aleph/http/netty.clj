@@ -153,7 +153,7 @@
                         responses)
                       responses)
           requests+responses (splice responses requests)]
-      (on-closed requests+responses (fn [_] (.close netty-channel)))
+      (on-closed requests+responses (fn [] (.close netty-channel)))
       requests+responses)))
 
 (defn-instrumented http-connection-
