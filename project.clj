@@ -10,7 +10,7 @@
                  [io.netty/netty "3.6.6.Final"]
                  [com.vgeshel/lamina "0.5.0"]
                  [gloss "0.2.2"
-                  :exclusions [lamina]
+                  :exclusions [lamina]]
                  [potemkin "0.2.2"]
                  [cheshire "5.2.0"]
                  [commons-codec/commons-codec "1.7"]
