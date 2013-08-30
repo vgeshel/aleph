@@ -397,10 +397,11 @@
                       (str "?" (:query-string m)))))
         port (:port m)
         server-name (:server-name m)]
-    (.setHeader request "Host"
-      (str server-name
-        (when-not (elide-port? m)
-          (str ":" port))))
+    (when-not (get-in m [:headers "Host"])
+      (.setHeader request "Host"
+        (str server-name
+          (when-not (elide-port? m)
+            (str ":" port)))))
     (populate-netty-msg m request)))
 
 ;;;
